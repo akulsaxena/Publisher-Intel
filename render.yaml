@@ -1,0 +1,12 @@
+services:
+  - type: cron
+    name: joveo-publisher-intel
+    runtime: python
+    schedule: "0 3 * * 1-5"   # 8:30 AM IST = 03:00 UTC, Mon–Fri
+    buildCommand: pip install -r requirements.txt
+    startCommand: python brief.py
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false          # you paste this in the Render dashboard
+      - key: SLACK_WEBHOOK_URL
+        sync: false          # you paste this in the Render dashboard
