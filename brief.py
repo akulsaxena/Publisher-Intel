@@ -1,7 +1,7 @@
 """
 Joveo Publisher Intelligence Agent
 Runs daily, researches publisher partners, posts Slack digest.
-Uses Gemini 1.5 Pro via Google AI Studio + Google Search grounding.
+Uses Tavily for real-time search + Gemini for analysis.
 """
 
 import os
@@ -9,14 +9,19 @@ import json
 import datetime
 import requests
 import google.generativeai as genai
-from google.generativeai.types import Tool, GoogleSearchRetrieval
+from tavily import TavilyClient
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
-GEMINI_MODEL = "gemini-1.5-pro"
+# Shubhankar's Gemini API Key
+GEMINI_API_KEY = "AIzaSyBsMmTsHq8QNdxkkXx3oANpoIB5XvDihJ0"
+# Supply Partnership Product Channel
+SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/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"
+# Shubhankar's Tavilu API Key
+TAVILY_API_KEY = "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"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 genai.configure(api_key=GEMINI_API_KEY)
+tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
 # ── Publisher Lists ───────────────────────────────────────────────────────────
 P0_PUBLISHERS = [
@@ -90,137 +95,171 @@ def get_todays_publishers():
     return label, publishers, coverage_label, next_label
 
 
-# ── Gemini Research Call ──────────────────────────────────────────────────────
-def research_publishers(publishers: list, coverage_label: str) -> str:
-    today = datetime.date.today()
-    date_str = today.strftime("%A, %d %B %Y")
+# ── Tavily Search ─────────────────────────────────────────────────────────────
+def fetch_news(publishers):
+    all_results = []
 
-    publisher_list_str = "\n".join(f"- {p}" for p in publishers)
+    for pub in publishers[:12]:  # limit for speed
+        query = f"{pub} funding OR acquisition OR hiring OR layoffs OR product launch OR pricing changes OR new location OR new expansions last 7 days"
 
-    prompt = f"""You are the Joveo Publisher Intelligence Agent — a daily briefing system for the Partnerships team at Joveo, a programmatic job advertising platform.
+        try:
+            results = tavily.search(
+                query=query,
+                search_depth="advanced",
+                max_results=3,
+                days = 7
+            )
+            all_results.extend(results["results"])
+        except Exception as e:
+            print(f"Search failed for {pub}: {e}")
 
-Today is {date_str}. You are researching the following publisher partners:
+    return all_results
 
-{publisher_list_str}
+from datetime import datetime as dt, timedelta
 
-YOUR TASK:
-Use your web search capability to research each publisher above. For each one, look for:
-1. Product / feature launches — new job ad formats, ranking algorithm changes, ATS integrations, AI features
-2. Pricing model changes — CPC/CPA rate changes, new pricing tiers, auction model shifts
-3. Funding, M&A, acquisitions
-4. Leadership changes — new CRO, CPO, Head of Partnerships
-5. Publisher network expansions or contractions
-6. Competitive moves — signing with or dropping a competitor of Joveo
-7. Hiring signals — rapid growth or layoffs
-8. Regulatory or legal news
+def filter_recent_news(results):
+    filtered = []
+    cutoff = dt.now() - timedelta(days=7)
 
-CRITICAL RULES:
-- Only include news from the LAST 14 DAYS maximum
-- Do NOT include generic blog posts, award wins, or recycled news
-- Research multiple publishers and then SELECT ONLY THE TOP 5 most impactful items across all publishers
-- Prioritise by business impact to Joveo — a funding round beats a minor blog post
+    for item in results:
+        if "published_date" in item and item["published_date"]:
+            try:
+                pub_date = dt.fromisoformat(item["published_date"])
+                if pub_date >= cutoff:
+                    filtered.append(item)
+            except:
+                filtered.append(item)  # fallback if parsing fails
+        else:
+            filtered.append(item)
 
-OUTPUT FORMAT — produce exactly this Slack message, nothing else before or after:
+    return filtered
 
-*📡 Joveo Publisher Intel — {date_str}*
+# ── Gemini Processing ─────────────────────────────────────────────────────────
+def generate_brief(news_data, coverage_label):
+    today = datetime.date.today().strftime("%A, %d %B %Y")
 
-*[Publisher Name]*
-→ [One tight sentence: what happened + why it matters to Joveo] | _[Source Name]_
+    context = "\n\n".join([
+        f"TITLE: {item['title']}\nURL: {item['url']}\nCONTENT: {item['content']}"
+        for item in news_data
+    ])
 
-*[Publisher Name]*
-→ [One tight sentence: what happened + why it matters to Joveo] | _[Source Name]_
+    prompt = f"""
+You are the Joveo Publisher Intelligence Agent.
 
-*[Publisher Name]*
-→ [One tight sentence: what happened + why it matters to Joveo] | _[Source Name]_
+Today is {today}.
 
-*[Publisher Name]*
-→ [One tight sentence: what happened + why it matters to Joveo] | _[Source Name]_
+Below is REAL-TIME news data collected from the web:
 
-*[Publisher Name]*
-→ [One tight sentence: what happened + why it matters to Joveo] | _[Source Name]_
+{context}
 
-_Researched via: [comma-separated list of sources used]_
-_Coverage today: {coverage_label} | Next: [next segment]_
+TASK:
+From this data, select the TOP 5 most impactful updates relevant to Joveo.
 
-STYLE RULES:
-- Exactly ONE sentence per news item — no paragraphs
-- Lead with the implication for Joveo, not just the raw fact
-- Active voice always
-- No filler words like "reportedly", "it seems", "in a move that"
-- If no significant news found for a publisher, skip them and move to the next
-- If fewer than 5 genuinely newsworthy items exist today, publish fewer — do NOT pad with weak stories
+OUTPUT FORMAT:
 
-Now research and produce the brief."""
+📡 *Joveo Publisher Intel*
+📅 {today}
 
-    # Use Gemini with Google Search grounding for live web research
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
-        tools=[Tool(google_search_retrieval=GoogleSearchRetrieval())]
-    )
+━━━━━━━━━━━━━━━━━━
 
+For each item:
+
+[Impact Emoji] *[Publisher Name]*
+[One sentence insight explaining what happened + why it matters to Joveo]
+
+Source | 🔗 <URL>
+
+(Repeat up to 5 items, each separated by a blank line)
+
+━━━━━━━━━━━━━━━━━━
+
+📊 _Coverage: {coverage_label}_
+🔎 _Source: Tavily_
+
+---
+
+IMPACT TAG RULES:
+- Use 🔥 for high-impact (funding, major product launches, large layoffs, acquisitions)
+- Use ⚠️ for risk signals (declining hiring, layoffs, revenue pressure)
+- Use 📈 for growth signals (expansion, hiring surge, new markets)
+- Use 🧠 for strategic/product updates
+
+---
+
+FORMATTING RULES:
+- Always include the URL as a clickable link using 🔗
+- Keep each item visually separated
+- Keep it clean and scannable
+- Ensure there is a blank line between each item
+- Do NOT cluster items together
+- Keep formatting clean and readable
+
+RULES:
+- Only use the provided data. Order items by impact (highest first)
+- No hallucination
+- Max 5 items (Only important ones) - give less if 5 are not very important
+- One sentence each
+
+IMPORTANT:
+- Focus on important news from the LAST 7 DAYS
+"""
+
+    model = genai.GenerativeModel(GEMINI_MODEL)
     response = model.generate_content(prompt)
+
     return response.text.strip()
 
+def deduplicate_news(results):
+    seen_urls = set()
+    unique = []
 
-# ── Slack Posting ─────────────────────────────────────────────────────────────
-def post_to_slack(message: str) -> bool:
-    payload = {"text": message}
+    for item in results:
+        if item["url"] not in seen_urls:
+            seen_urls.add(item["url"])
+            unique.append(item)
+
+    return unique
+
+# ── Slack ─────────────────────────────────────────────────────────────────────
+def post_to_slack(message):
     response = requests.post(
         SLACK_WEBHOOK_URL,
-        data=json.dumps(payload),
-        headers={"Content-Type": "application/json"},
-        timeout=10
+        data=json.dumps({"text": message}),
+        headers={"Content-Type": "application/json"}
     )
     return response.status_code == 200
 
-
-# ── Fallback: post error to Slack if something breaks ────────────────────────
-def post_error_to_slack(error: str):
-    message = f":warning: *Joveo Publisher Intel — failed to run*\n```{error}```\nCheck Render logs for details."
-    requests.post(
-        SLACK_WEBHOOK_URL,
-        data=json.dumps({"text": message}),
-        headers={"Content-Type": "application/json"},
-        timeout=10
-    )
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    print(f"[{datetime.datetime.now().isoformat()}] Starting Joveo Publisher Intel...")
+    print("Starting Publisher Intel...")
 
-    label, publishers, coverage_label, next_label = get_todays_publishers()
+    label, publishers, coverage_label, _ = get_todays_publishers()
+    # label = "P1/P2 Test"
+    # publishers = P1_P2_PUBLISHERS
+    # coverage_label = "P1/P2 publishers"
 
     if publishers is None:
-        print("Today is a weekend — no brief scheduled.")
+        print("Weekend — skipping")
         return
 
-    print(f"Coverage today: {label} ({len(publishers)} publishers)")
-    print(f"Publishers: {', '.join(publishers[:5])}{'...' if len(publishers) > 5 else ''}")
+    print("Fetching real-time news...")
+    news = fetch_news(publishers)
+    news = filter_recent_news(news)
+    news = deduplicate_news(news)
 
-    try:
-        print("Calling Gemini with Google Search grounding...")
-        brief = research_publishers(publishers, coverage_label)
-        print("Brief generated successfully.")
-        print("─" * 60)
-        print(brief)
-        print("─" * 60)
+    print(f"Collected {len(news)} news items")
 
-        print("Posting to Slack...")
-        success = post_to_slack(brief)
+    if not news:
+        print("No news found — exiting")
+        return
 
-        if success:
-            print("✅ Posted to Slack successfully.")
-        else:
-            print("❌ Slack post failed — check webhook URL.")
-            post_error_to_slack("Slack webhook returned non-200 status.")
+    print("Generating brief...")
+    brief = generate_brief(news, coverage_label)
 
-    except Exception as e:
-        error_msg = str(e)
-        print(f"❌ Error: {error_msg}")
-        post_error_to_slack(error_msg)
-        raise
+    print("Posting to Slack...")
+    post_to_slack(brief)
 
+    print("Done.")
 
 if __name__ == "__main__":
     main()
