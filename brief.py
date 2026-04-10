@@ -5,20 +5,26 @@ Uses Tavily for real-time search + Gemini for analysis.
 """
 
 import os
-import json
+import time
 import datetime
 import requests
 import google.generativeai as genai
 from tavily import TavilyClient
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# Shubhankar's Gemini API Key
-GEMINI_API_KEY = "AIzaSyBsMmTsHq8QNdxkkXx3oANpoIB5XvDihJ0"
-# Supply Partnership Product Channel
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-# Shubhankar's Tavily API Key
-TAVILY_API_KEY = "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"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 GEMINI_MODEL = "gemini-2.5-flash"
+
+if not SLACK_WEBHOOK_URL:
+    raise ValueError("SLACK_WEBHOOK_URL not set")
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY not set")
+
+if not TAVILY_API_KEY:
+    raise ValueError("TAVILY_API_KEY not set")
 
 genai.configure(api_key=GEMINI_API_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
@@ -221,13 +227,22 @@ def deduplicate_news(results):
     return unique
 
 # ── Slack ─────────────────────────────────────────────────────────────────────
-def post_to_slack(message):
-    response = requests.post(
-        SLACK_WEBHOOK_URL,
-        data=json.dumps({"text": message}),
-        headers={"Content-Type": "application/json"}
-    )
-    return response.status_code == 200
+def post_to_slack(message, retries=3):
+    for i in range(retries):
+        try:
+            response = requests.post(
+                SLACK_WEBHOOK_URL,
+                json={"text": message},
+                timeout=20
+            )
+            if response.status_code == 200:
+                return True
+        except Exception as e:
+            print(f"Attempt {i+1} failed: {e}")
+
+        time.sleep(2)
+
+    return False
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -250,14 +265,34 @@ def main():
     print(f"Collected {len(news)} news items")
 
     if not news:
-        print("No news found — exiting")
+        today_str = datetime.date.today().strftime("%A, %d %B %Y")
+
+        message = f"""
+📡 Joveo Publisher Intel — {today_str}
+
+No impactful updates relevant to Joveo were found for {coverage_label} within the last 7 days.
+
+Researched via: Tavily  
+Coverage today: {coverage_label}
+"""
+
+        post_to_slack(message.strip())
         return
 
     print("Generating brief...")
     brief = generate_brief(news, coverage_label)
 
+    if not brief:
+        print("No brief generated — skipping Slack")
+        return
+
     print("Posting to Slack...")
-    post_to_slack(brief)
+    success = post_to_slack(brief)
+
+    if not success:
+        print("❌ Slack post failed")
+    else:
+        print("✅ Slack post success")
 
     print("Done.")
 
