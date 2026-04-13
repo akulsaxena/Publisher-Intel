@@ -8,14 +8,38 @@ import os
 import time
 import datetime
 import requests
+import re
+from datetime import datetime as dt, timedelta
+from datetime import timezone
 import google.generativeai as genai
 from tavily import TavilyClient
+from bs4 import BeautifulSoup
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
+def get_sheet():
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive"
+    ]
+
+    creds = ServiceAccountCredentials.from_json_keyfile_name(
+        "credentials.json", scope
+    )
+
+    client = gspread.authorize(creds)
+    sheet = client.open("Joveo Intel Logs").sheet1
+
+    return sheet
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 if not SLACK_WEBHOOK_URL:
     raise ValueError("SLACK_WEBHOOK_URL not set")
@@ -106,7 +130,7 @@ def fetch_news(publishers):
     all_results = []
 
     for pub in publishers[:12]:  # limit for speed
-        query = f"{pub} funding OR acquisition OR hiring OR layoffs OR product launch OR pricing changes OR new location OR new expansions last 7 days"
+        query = f"""("{pub}") AND (funding OR acquisition OR hiring OR layoffs OR product launch OR expansion OR launch OR feature OR product OR update OR new OR ai OR platform OR tool OR partnership OR integration OR growth OR strategy) AND (last 7 days)"""
 
         try:
             results = tavily.search(
@@ -123,29 +147,159 @@ def fetch_news(publishers):
 
 from datetime import datetime as dt, timedelta
 
-def filter_recent_news(results):
-    filtered = []
-    cutoff = dt.now() - timedelta(days=7)
+def fetch_article_date(url):
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        }
+        res = requests.get(url, headers=headers, timeout=20)
+        html = res.text
 
-    for item in results:
-        if "published_date" in item and item["published_date"]:
-            try:
-                pub_date = dt.fromisoformat(item["published_date"])
-                if pub_date >= cutoff:
-                    filtered.append(item)
-            except:
-                filtered.append(item)  # fallback if parsing fails
-        else:
-            filtered.append(item)
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Try multiple common meta tags
+        meta_tags = [
+            {"property": "article:published_time"},
+            {"name": "article:published_time"},
+            {"property": "og:published_time"},
+            {"name": "pubdate"},
+            {"name": "publish-date"},
+        ]
+
+        for tag in meta_tags:
+            meta = soup.find("meta", tag)
+            if meta and meta.get("content"):
+                try:
+                    return dt.fromisoformat(meta["content"].replace("Z", "+00:00"))
+                except:
+                    pass
+
+    except Exception as e:
+        print(f"Failed to fetch date from {url}: {e}")
+
+    return None
+
+def extract_date_from_text(text):
+    if not text:
+        return None
+
+    # ISO format (best case)
+    match = re.search(r'\d{4}-\d{2}-\d{2}', text)
+    if match:
+        try:
+            return dt.fromisoformat(match.group())
+        except:
+            return None
+
+    return None
+
+def quick_filter(news):
+    filtered = []
+
+    for item in news:
+        text = (item.get("title", "") + " " + item.get("content", "")).lower()
+        url = item.get("url", "")
+
+        current_year = dt.now().year
+
+        if any(str(year) in item.get("url", "") for year in range(2012, current_year - 1)):
+            continue
+
+        if any(f"/{year}/" in url for year in range(2012, current_year - 1)):
+            continue
+
+        filtered.append(item)
 
     return filtered
+
+def soft_rank_and_limit(news, limit=15):
+    def score(item):
+        text = (item.get("title", "") + " " + item.get("content", "")).lower()
+
+        score = 0
+
+        # Broad signals (not restrictive)
+        keywords = [
+            "launch", "feature", "product", "update", "new",
+            "ai", "platform", "tool", "partnership", "integration",
+            "expansion", "growth", "hiring", "strategy"
+        ]
+
+        for kw in keywords:
+            if kw in text:
+                score += 1
+
+        # Prefer longer content (more substance)
+        score += min(len(text) // 200, 3)
+
+        return score
+
+    return sorted(news, key=score, reverse=True)[:limit]
+
+def is_current_year_url(url):
+    current_year = dt.now().year
+    return f"/{current_year}/" in url
+
+def filter_recent_news(results):
+    filtered = []
+    cutoff = dt.now(timezone.utc) - timedelta(days=7)
+
+    for item in results:
+        url = item.get("url", "")
+        if is_aggregator_page(url):
+            continue
+
+        if is_current_year_url(url):
+            filtered.append(item)
+            continue
+        pub_date = None
+
+        # Tavily metadata
+        if item.get("published_date"):
+            try:
+                pub_date = dt.fromisoformat(item["published_date"])
+            except:
+                pass
+
+        # Fetch from HTML
+        if not pub_date:
+            pub_date = fetch_article_date(item["url"])
+
+        if not pub_date:
+            pub_date = extract_date_from_text(item.get("content", ""))
+
+        if pub_date is None:
+            continue
+
+        if pub_date.tzinfo is None:
+            pub_date = pub_date.replace(tzinfo=timezone.utc)
+
+        # Compare safely
+        if pub_date < cutoff:
+            continue
+
+        filtered.append(item)
+
+    return filtered
+
+def is_aggregator_page(url):
+    bad_patterns = [
+        "mass-layoffs", "layoff-tracker", "layoffs-tracker", "job-cuts", 
+        "job-losses", "companies-that", "company-list", "list-of", "roundup", 
+        "weekly-roundup", "monthly-roundup", "latest-updates", "industry-updates", 
+        "market-update"
+    ]
+
+    url_lower = url.lower()
+
+    return any(p in url_lower for p in bad_patterns)
 
 # ── Gemini Processing ─────────────────────────────────────────────────────────
 def generate_brief(news_data, coverage_label):
     today = datetime.date.today().strftime("%A, %d %B %Y")
 
     context = "\n\n".join([
-        f"TITLE: {item['title']}\nURL: {item['url']}\nCONTENT: {item['content']}"
+        f"TITLE: {item['title']}\nURL: {item['url']}\nCONTENT: {item['content'][:300]}"
         for item in news_data
     ])
 
@@ -201,13 +355,14 @@ FORMATTING RULES:
 - Keep formatting clean and readable
 
 RULES:
-- Only use the provided data. Order items by impact (highest first)
+- Only use the provided data. Order items by impact (highest first) and date (latest to oldest)
 - No hallucination
 - Max 5 items (Only important ones) - give less if 5 are not very important
 - One sentence each
 
 IMPORTANT:
 - Focus on important news from the LAST 7 DAYS
+- Ignore any news older than 7 days, even if provided.
 """
 
     model = genai.GenerativeModel(GEMINI_MODEL)
@@ -244,6 +399,21 @@ def post_to_slack(message, retries=3):
 
     return False
 
+def load_sent_urls():
+    sheet = get_sheet()
+    urls = sheet.col_values(1) 
+    return set(urls)
+
+def save_sent_urls(urls):
+    sheet = get_sheet()
+
+    existing = set(sheet.col_values(1))
+
+    new_urls = [url for url in urls if url not in existing]
+
+    if new_urls:
+        sheet.append_rows([[url] for url in new_urls])
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print("Starting Publisher Intel...")
@@ -259,8 +429,21 @@ def main():
 
     print("Fetching real-time news...")
     news = fetch_news(publishers)
+
+    print(f"Fetched {len(news)} raw items")
+
+    news = quick_filter(news)
+    print(f"After quick filter: {len(news)}")
+
+    news = soft_rank_and_limit(news)
+
     news = filter_recent_news(news)
+    print(f"After date filter: {len(news)}")
+
     news = deduplicate_news(news)
+    sent_urls = load_sent_urls()
+
+    news = [item for item in news if item["url"] not in sent_urls]
 
     print(f"Collected {len(news)} news items")
 
@@ -288,6 +471,7 @@ Coverage today: {coverage_label}
 
     print("Posting to Slack...")
     success = post_to_slack(brief)
+    save_sent_urls([item["url"] for item in news])
 
     if not success:
         print("❌ Slack post failed")
