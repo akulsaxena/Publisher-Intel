@@ -64,8 +64,6 @@ def cron(authorization: str | None = Header(default=None)) -> dict:
         missing.append("SLACK_WEBHOOK_URL")
     if not settings.gemini_api_key:
         missing.append("GEMINI_API_KEY")
-    if not settings.tavily_api_key:
-        missing.append("TAVILY_API_KEY")
     if missing:
         raise HTTPException(
             status_code=503,
