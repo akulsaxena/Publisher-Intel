@@ -78,9 +78,13 @@ Publisher-Intel/
                                   Run BEFORE the date filter so we don't
                                   spend HTTP fetches on duplicates.
                                     ↓
-   5. Filter previously sent     load_sent_urls() reads column A of the
-                                  configured Google Sheet. Drops any URL
-                                  already posted in a prior run.
+   5. Filter previously sent     load_sent_items() reads columns A (URL) and
+                                  B (Title) of the configured Google Sheet.
+                                  filter_ledger() drops items whose URL is in
+                                  the ledger OR whose title is similar
+                                  (difflib ≥ 0.85) to a previously-sent title —
+                                  catches Google News RSS redirect URLs that
+                                  change between runs for the same article.
                                     ↓
    6. Date filter                filter_recent_news()
                                   /{current_year}/ in URL → keep
@@ -108,8 +112,9 @@ Publisher-Intel/
    10. Post to Slack             post_to_slack()
                                   3 retries with exponential backoff (2s, 4s).
                                     ↓
-   11. On HTTP 200 only:         save_sent_urls() appends to column A so
-       persist URLs to Sheet     future runs won't re-post the same items.
+   11. On HTTP 200 only:         save_sent_items() appends (URL, Title) rows
+       persist to Sheet           to columns A and B so future runs won't
+                                  re-post the same items.
                                     ↓
                         Return JSON status to Vercel
 ```
